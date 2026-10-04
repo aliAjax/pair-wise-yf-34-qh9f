@@ -6,42 +6,20 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from common import ApiError, boxes_overlap, iso, parse_time, route_bbox, times_overlap, utcnow
+from recon import api as recon_api
+from recon.service import ReconService
+
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: Any = None):
-        super().__init__(message); self.status, self.code, self.message, self.details = status, code, message, details
-
-
-def utcnow() -> datetime: return datetime.now(timezone.utc)
-def iso(value: datetime | None = None) -> str: return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-def parse_time(value: str | None) -> datetime:
-    if not value: raise ApiError(400, "time_required", "必须提供 ISO 8601 时间")
-    try: parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc: raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-
-
-def route_bbox(route: list[list[float]]) -> tuple[float, float, float, float]:
-    xs = [float(point[0]) for point in route]; ys = [float(point[1]) for point in route]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
-    return a[0] <= b[2] + buffer and a[2] + buffer >= b[0] and a[1] <= b[3] + buffer and a[3] + buffer >= b[1]
-
-
-def times_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool: return a_start < b_end and b_start < a_end
 
 
 def validate_route(route: Any) -> list[list[float]]:
@@ -58,6 +36,7 @@ def validate_route(route: Any) -> list[list[float]]:
 class Repository:
     def __init__(self, path: str | Path):
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
+        self.write_lock = threading.RLock()
         self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS restrictions(
@@ -89,9 +68,11 @@ class Repository:
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try: yield self.conn; self.conn.execute("COMMIT")
-        except Exception: self.conn.execute("ROLLBACK"); raise
+        # 单连接上的写事务必须用锁串行化，否则并发请求会在 BEGIN 处互相踩事务状态
+        with self.write_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try: yield self.conn; self.conn.execute("COMMIT")
+            except Exception: self.conn.execute("ROLLBACK"); raise
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -104,7 +85,9 @@ class Repository:
 
 
 class DroneAirspaceService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self.recon = ReconService(self.repo)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -130,7 +113,31 @@ class DroneAirspaceService:
         with self.repo.tx() as conn:
             cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,created_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
-            return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone()
+            self.recon.invalidate_for_restriction(conn, row)
+            return dict(row)
+
+    def change_restriction(self, restriction_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            if not row: raise ApiError(404, "restriction_not_found", "空域限制不存在")
+            start, end = parse_time(body.get("starts_at", row["starts_at"])), parse_time(body.get("ends_at", row["ends_at"]))
+            try:
+                min_lon, min_lat = float(body.get("min_lon", row["min_lon"])), float(body.get("min_lat", row["min_lat"]))
+                max_lon, max_lat = float(body.get("max_lon", row["max_lon"])), float(body.get("max_lat", row["max_lat"]))
+                min_alt, max_alt = float(body.get("min_altitude", row["min_altitude"])), float(body.get("max_altitude", row["max_altitude"]))
+            except (TypeError, ValueError): raise ApiError(400, "invalid_restriction", "空域范围和高度必须为数字")
+            status, reason = str(body.get("status", row["status"])).strip(), str(body.get("reason", row["reason"])).strip()
+            if status not in {"active", "lifted"} or not reason: raise ApiError(400, "invalid_restriction", "状态必须是 active 或 lifted，原因必填")
+            if min_lon >= max_lon or min_lat >= max_lat or min_alt < 0 or max_alt <= min_alt or end <= start:
+                raise ApiError(400, "invalid_restriction", "空域范围、高度或时间无效")
+            conn.execute("""UPDATE restrictions SET min_lon=?,min_lat=?,max_lon=?,max_lat=?,min_altitude=?,max_altitude=?,starts_at=?,ends_at=?,reason=?,status=?
+                            WHERE id=?""", (min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, status, restriction_id))
+            updated = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            Repository.audit(conn, None, actor, role, "restriction_changed", {"restriction_id": restriction_id, "status": status})
+            if status == "active": self.recon.invalidate_for_restriction(conn, updated)
+            return dict(updated)
 
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
@@ -274,7 +281,9 @@ class DroneAirspaceService:
             conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
                          (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
-            if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
+            if plan["status"] == "approved":
+                self.recon.on_plan_changed(conn, plan, "plan_changed")
+                Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
 
@@ -289,6 +298,7 @@ class DroneAirspaceService:
             if plan["status"] == "expired": raise ApiError(409, "plan_expired", "已过期计划不能取消")
             conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
+            if plan["status"] == "approved": self.recon.on_plan_changed(conn, plan, "plan_canceled")
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
 
@@ -339,6 +349,7 @@ class Handler(BaseHTTPRequestHandler):
     def get_api(self, path: str) -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "drone-airspace"}
         actor, role, operator = self.service.identity(self.headers)
+        if path.startswith("/api/recon"): return recon_api.handle_get(self.service.recon, path, actor, role, operator)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
         parts = [p for p in path.split("/") if p]
@@ -347,7 +358,9 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
+        if path.startswith("/api/recon"): return recon_api.handle_post(self.service.recon, path, actor, role, operator, body)
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "restrictions"] and parts[2].isdigit() and parts[3] == "change": return 200, self.service.change_restriction(int(parts[2]), actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
