@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from recon import ReconciliationService
+
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
@@ -63,7 +65,8 @@ class Repository:
         CREATE TABLE IF NOT EXISTS restrictions(
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL, min_lon REAL NOT NULL, min_lat REAL NOT NULL,
             max_lon REAL NOT NULL, max_lat REAL NOT NULL, min_altitude REAL NOT NULL DEFAULT 0, max_altitude REAL NOT NULL,
-            starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+            starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS flight_plans(
             id INTEGER PRIMARY KEY AUTOINCREMENT, operator_id TEXT NOT NULL, callsign TEXT NOT NULL, drone_model TEXT NOT NULL,
@@ -75,11 +78,11 @@ class Repository:
         CREATE TABLE IF NOT EXISTS approvals(
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id), plan_revision INTEGER NOT NULL,
             reviewer TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, offline_id TEXT UNIQUE,
-            override_kind TEXT, created_at TEXT NOT NULL
+            override_kind TEXT, restrictions_json TEXT, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS notifications(
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id), kind TEXT NOT NULL,
-            message TEXT NOT NULL, created_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
+            message TEXT NOT NULL, created_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, dedup_key TEXT
         );
         CREATE TABLE IF NOT EXISTS audit_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL,
@@ -131,6 +134,36 @@ class DroneAirspaceService:
             cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,created_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
             return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def change_restriction(self, restriction_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必填")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            if not row: raise ApiError(404, "restriction_not_found", "限制不存在")
+            if row["revision"] != expected: raise ApiError(409, "revision_conflict", "限制版本已变化")
+            name = str(body.get("name", row["name"])).strip(); kind = str(body.get("kind", row["kind"])).strip()
+            reason = str(body.get("reason", row["reason"])).strip()
+            if kind not in {"no_fly", "temporary_limit"} or not name or not reason: raise ApiError(400, "invalid_restriction", "名称、类型和原因必填")
+            try:
+                min_lon = float(body["min_lon"]) if "min_lon" in body else row["min_lon"]
+                min_lat = float(body["min_lat"]) if "min_lat" in body else row["min_lat"]
+                max_lon = float(body["max_lon"]) if "max_lon" in body else row["max_lon"]
+                max_lat = float(body["max_lat"]) if "max_lat" in body else row["max_lat"]
+                min_alt = float(body["min_altitude"]) if "min_altitude" in body else row["min_altitude"]
+                max_alt = float(body["max_altitude"]) if "max_altitude" in body else row["max_altitude"]
+            except (TypeError, ValueError): raise ApiError(400, "invalid_restriction", "空域范围和高度必须为数字")
+            start = parse_time(body["starts_at"]) if "starts_at" in body else parse_time(row["starts_at"])
+            end = parse_time(body["ends_at"]) if "ends_at" in body else parse_time(row["ends_at"])
+            if min_lon >= max_lon or min_lat >= max_lat or min_alt < 0 or max_alt <= min_alt or end <= start:
+                raise ApiError(400, "invalid_restriction", "空域范围、高度或时间无效")
+            revision = expected + 1
+            conn.execute("""UPDATE restrictions SET name=?,kind=?,min_lon=?,min_lat=?,max_lon=?,max_lat=?,min_altitude=?,max_altitude=?,
+                                                   starts_at=?,ends_at=?,reason=?,revision=?,updated_at=? WHERE id=?""",
+                         (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, revision, iso(), restriction_id))
+            Repository.audit(conn, None, actor, role, "restriction_changed", {"from_revision": expected, "to_revision": revision})
+            return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone())
 
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
@@ -189,6 +222,21 @@ class DroneAirspaceService:
         if adjacent: blocking.append({"code": "adjacent_traffic", "plans": adjacent, "message": "相邻航路与有效计划重叠"})
         return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
 
+    @staticmethod
+    def _restrictions_snapshot(conn: sqlite3.Connection, plan: sqlite3.Row) -> dict[str, int]:
+        """Map of overlapping active restriction id -> revision at approval time."""
+        route = json.loads(plan["route_json"]); bbox = route_bbox(route)
+        start, end = parse_time(plan["starts_at"]), parse_time(plan["ends_at"])
+        snapshot: dict[str, int] = {}
+        for restriction in conn.execute("SELECT * FROM restrictions WHERE status='active'"):
+            rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
+            if not boxes_overlap(bbox, rbox): continue
+            if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): continue
+            altitude_overlap = plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0
+            if not altitude_overlap: continue
+            snapshot[str(restriction["id"])] = restriction["revision"]
+        return snapshot
+
     def get_plan(self, plan_id: int, role: str, operator: str = "") -> dict[str, Any]:
         conn = self.repo.conn; row = self._plan_row(conn, plan_id)
         if role == "operator" and row["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能查看其他运营方计划")
@@ -230,8 +278,9 @@ class DroneAirspaceService:
             if report["blocking_conflicts"] and not (role == "commander" and override):
                 raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
             override_kind = "emergency_authority" if report["blocking_conflicts"] else None
-            cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, iso()))
+            snapshot = self._restrictions_snapshot(conn, plan)
+            cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,restrictions_json,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, json.dumps(snapshot, sort_keys=True), iso()))
             conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
             if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
             Repository.audit(conn, plan_id, actor, role, "plan_approved", {"revision": expected, "offline_id": offline_id})
@@ -327,7 +376,7 @@ def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> Non
 
 
 class Handler(BaseHTTPRequestHandler):
-    service: DroneAirspaceService; web_root: Path
+    service: DroneAirspaceService; recon: ReconciliationService; web_root: Path
     def log_message(self, fmt: str, *args: Any) -> None: print(f"{self.address_string()} - {fmt % args}")
     def body(self) -> dict[str, Any]:
         size = int(self.headers.get("Content-Length", "0"))
@@ -341,15 +390,19 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/recon/batches": return 200, self.recon.list_batches(role)
+        if path == "/api/recon/desk": return 200, self.recon.desk(role, operator)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
+        if len(parts) == 4 and parts[:3] == ["api", "recon", "batches"] and parts[3].isdigit(): return 200, self.recon.get_batch(int(parts[3]), role)
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
+        if path == "/api/recon/batches": return 201, self.recon.create_batch(actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             pid, action = int(parts[2]), parts[3]
             routes = {
@@ -360,6 +413,14 @@ class Handler(BaseHTTPRequestHandler):
                 "cancel": lambda: self.service.cancel(pid, actor, role, operator, body),
             }
             if action in routes: return 200, routes[action]()
+        if len(parts) == 4 and parts[:2] == ["api", "restrictions"] and parts[2].isdigit():
+            if parts[3] == "change": return 200, self.service.change_restriction(int(parts[2]), actor, role, body)
+        if len(parts) == 5 and parts[:3] == ["api", "recon", "batches"] and parts[3].isdigit():
+            bid, action = int(parts[3]), parts[4]
+            if action == "receipts": return 201, self.recon.submit_receipt(bid, actor, role, operator, body)
+            if action == "conclude": return 200, self.recon.conclude_batch(bid, actor, role, body)
+        if len(parts) == 5 and parts[:3] == ["api", "recon", "conclusions"] and parts[3].isdigit():
+            if parts[4] == "adjudicate": return 200, self.recon.adjudicate(int(parts[3]), actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
@@ -371,13 +432,22 @@ class Handler(BaseHTTPRequestHandler):
             payload = {"error": exc.code, "message": exc.message}
             if exc.details is not None: payload["details"] = exc.details
             send_json(self, exc.status, payload)
-        except Exception as exc: print(f"unhandled error: {exc!r}"); send_json(self, 500, {"error": "internal_error", "message": str(exc)})
+        except Exception as exc:
+            # ReconError mirrors ApiError but lives in the recon package.
+            if exc.__class__.__name__ == "ReconError":
+                payload = {"error": exc.code, "message": exc.message}
+                if exc.details is not None: payload["details"] = exc.details
+                send_json(self, exc.status, payload)
+            else:
+                print(f"unhandled error: {exc!r}"); send_json(self, 500, {"error": "internal_error", "message": str(exc)})
     def do_GET(self) -> None: self.handle_request("GET")
     def do_POST(self) -> None: self.handle_request("POST")
 
 
 def create_server(db_path: str | Path, host: str = "127.0.0.1", port: int = PORT) -> ThreadingHTTPServer:
-    service = DroneAirspaceService(db_path); handler = type("DroneHandler", (Handler,), {"service": service, "web_root": Path(__file__).resolve().parent / "static"}); return ThreadingHTTPServer((host, port), handler)
+    service = DroneAirspaceService(db_path); recon = ReconciliationService(db_path)
+    handler = type("DroneHandler", (Handler,), {"service": service, "recon": recon, "web_root": Path(__file__).resolve().parent / "static"})
+    return ThreadingHTTPServer((host, port), handler)
 
 
 def main() -> None:
